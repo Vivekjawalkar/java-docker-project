@@ -2,6 +2,8 @@ pipeline {
     agent any
 
     environment {
+	JAVA_HOME = '/usr/lib/jvm/java-21-amazon-corretto.x86_64'
+  	PATH = "${JAVA_HOME}/bin:${env.PATH}"
         AWS_REGION     = 'us-east-1'
         AWS_ACCOUNT_ID = '434504868934'
 
