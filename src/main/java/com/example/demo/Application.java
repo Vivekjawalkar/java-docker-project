@@ -15,7 +15,7 @@ public class Application {
 
     @GetMapping("/")
     public String home() {
-        return "Hello from Java Docker Application - Version 1.1";
+        return "Hello from Java Docker Application - Version 1.2";
     }
 
     @GetMapping("/health")
