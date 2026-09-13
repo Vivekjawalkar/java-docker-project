@@ -2,7 +2,7 @@ FROM amazoncorretto:21
 
 WORKDIR /app
 
-COPY app.jar app.jar
+COPY target/*.jar app.jar
 
 EXPOSE 8080
 
