@@ -2,8 +2,9 @@ pipeline {
     agent any
 
     environment {
-	JAVA_HOME = '/usr/lib/jvm/java-21-amazon-corretto.x86_64'
-  	PATH = "${JAVA_HOME}/bin:${env.PATH}"
+        JAVA_HOME = '/usr/lib/jvm/java-21-amazon-corretto.x86_64'
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+
         AWS_REGION     = 'us-east-1'
         AWS_ACCOUNT_ID = '434504868934'
 
@@ -11,18 +12,24 @@ pipeline {
         ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         IMAGE_NAME     = "${ECR_REGISTRY}/${ECR_REPOSITORY}"
 
-        ECS_CLUSTER    = 'java-app-cluster'
-        ECS_SERVICE    = 'java-app-service'
-        TASK_FAMILY    = 'java-app-task'
+        ECS_CLUSTER = 'java-app-cluster'
+
+        DEV_SERVICE      = 'java-app-dev-service'
+        DEV_TASK_FAMILY  = 'java-app-dev-task'
+
+        PROD_SERVICE     = 'java-app-prod-service'
+        PROD_TASK_FAMILY = 'java-app-prod-task'
+
         CONTAINER_NAME = 'java-app'
 
-        IMAGE_TAG      = "${BUILD_NUMBER}"
+        IMAGE_TAG = "${BUILD_NUMBER}"
     }
 
     stages {
 
         stage('Checkout') {
             steps {
+                echo '=== Checkout Source Code ==='
                 checkout scm
             }
         }
@@ -54,9 +61,8 @@ pipeline {
                       -t ${IMAGE_NAME}:${IMAGE_TAG} \
                       .
 
-                    docker tag \
-                      ${IMAGE_NAME}:${IMAGE_TAG} \
-                      ${IMAGE_NAME}:latest
+                    echo "Docker image created:"
+                    echo "${IMAGE_NAME}:${IMAGE_TAG}"
                 '''
             }
         }
@@ -81,29 +87,29 @@ pipeline {
                     echo "=== Push Image to ECR ==="
 
                     docker push ${IMAGE_NAME}:${IMAGE_TAG}
-                    docker push ${IMAGE_NAME}:latest
+
+                    echo "Image pushed successfully:"
+                    echo "${IMAGE_NAME}:${IMAGE_TAG}"
                 '''
             }
         }
 
-        stage('Create ECS Task Definition') {
+        stage('Deploy to DEV') {
             steps {
                 sh '''
-                    echo "=== Download Current ECS Task Definition ==="
+                    echo "=== DEV DEPLOYMENT ==="
 
                     aws ecs describe-task-definition \
-                      --task-definition ${TASK_FAMILY} \
+                      --task-definition ${DEV_TASK_FAMILY} \
                       --region ${AWS_REGION} \
                       --query 'taskDefinition' \
-                      --output json > task-definition.json
-
-                    echo "=== Update Container Image ==="
+                      --output json > dev-task-definition.json
 
                     python3 <<'PY'
 import json
 import os
 
-with open("task-definition.json") as f:
+with open("dev-task-definition.json") as f:
     task = json.load(f)
 
 image = os.environ["IMAGE_NAME"] + ":" + os.environ["IMAGE_TAG"]
@@ -113,7 +119,7 @@ for container in task["containerDefinitions"]:
     if container["name"] == container_name:
         container["image"] = image
 
-remove_fields = [
+for field in [
     "taskDefinitionArn",
     "revision",
     "status",
@@ -121,87 +127,206 @@ remove_fields = [
     "compatibilities",
     "registeredAt",
     "registeredBy"
-]
-
-for field in remove_fields:
+]:
     task.pop(field, None)
 
-with open("new-task-definition.json", "w") as f:
+with open("dev-task-definition-new.json", "w") as f:
     json.dump(task, f)
 
-print("New image:", image)
+print("DEV image:", image)
 PY
 
-                    echo "=== Register New ECS Task Definition ==="
-
-                    NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-                      --cli-input-json file://new-task-definition.json \
+                    DEV_TASK_DEF_ARN=$(aws ecs register-task-definition \
+                      --cli-input-json file://dev-task-definition-new.json \
                       --region ${AWS_REGION} \
                       --query 'taskDefinition.taskDefinitionArn' \
                       --output text)
 
-                    echo "New Task Definition:"
-                    echo ${NEW_TASK_DEF_ARN}
-
-                    echo ${NEW_TASK_DEF_ARN} > new-task-definition-arn.txt
-                '''
-            }
-        }
-
-        stage('Deploy to ECS') {
-            steps {
-                sh '''
-                    echo "=== Deploy to ECS ==="
-
-                    NEW_TASK_DEF_ARN=$(cat new-task-definition-arn.txt)
+                    echo "DEV Task Definition:"
+                    echo "${DEV_TASK_DEF_ARN}"
 
                     aws ecs update-service \
                       --cluster ${ECS_CLUSTER} \
-                      --service ${ECS_SERVICE} \
-                      --task-definition ${NEW_TASK_DEF_ARN} \
+                      --service ${DEV_SERVICE} \
+                      --task-definition ${DEV_TASK_DEF_ARN} \
                       --force-new-deployment \
                       --region ${AWS_REGION}
 
-                    echo "ECS deployment started."
+                    echo "DEV deployment started."
                 '''
             }
         }
 
-        stage('Verify ECS Deployment') {
+        stage('Verify DEV') {
             steps {
                 sh '''
-                    echo "=== Waiting for ECS Service Stability ==="
+                    echo "=== VERIFY DEV ==="
 
                     aws ecs wait services-stable \
                       --cluster ${ECS_CLUSTER} \
-                      --services ${ECS_SERVICE} \
+                      --services ${DEV_SERVICE} \
                       --region ${AWS_REGION}
 
-                    echo "=== ECS Service Status ==="
+                    echo "=== DEV SERVICE STATUS ==="
 
                     aws ecs describe-services \
                       --cluster ${ECS_CLUSTER} \
-                      --services ${ECS_SERVICE} \
+                      --services ${DEV_SERVICE} \
                       --region ${AWS_REGION} \
-                      --query 'services[0].[serviceName,status,desiredCount,runningCount,pendingCount]' \
+                      --query 'services[0].[serviceName,status,desiredCount,runningCount,pendingCount,taskDefinition]' \
                       --output table
 
-                    echo "=== Running Container Image ==="
+                    echo "=== DEV RUNNING IMAGE ==="
 
                     TASK_ARN=$(aws ecs list-tasks \
                       --cluster ${ECS_CLUSTER} \
-                      --service-name ${ECS_SERVICE} \
+                      --service-name ${DEV_SERVICE} \
                       --desired-status RUNNING \
                       --region ${AWS_REGION} \
                       --query 'taskArns[0]' \
                       --output text)
 
-                    aws ecs describe-tasks \
+                    DEV_IMAGE=$(aws ecs describe-tasks \
                       --cluster ${ECS_CLUSTER} \
                       --tasks ${TASK_ARN} \
                       --region ${AWS_REGION} \
                       --query 'tasks[0].containers[?name==`java-app`].image' \
-                      --output text
+                      --output text)
+
+                    echo "DEV Running Image:"
+                    echo "${DEV_IMAGE}"
+
+                    EXPECTED_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+                    if [ "${DEV_IMAGE}" != "${EXPECTED_IMAGE}" ]; then
+                        echo "ERROR: DEV image does not match expected image."
+                        exit 1
+                    fi
+
+                    echo "DEV image verification successful."
+                '''
+            }
+        }
+
+        stage('Manual Approval for PROD') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    input message: 'DEV deployment verified. Deploy this image to PROD?', \
+                          ok: 'Deploy to PROD'
+                }
+            }
+        }
+
+        stage('Deploy to PROD') {
+            steps {
+                sh '''
+                    echo "=== PROD DEPLOYMENT ==="
+
+                    aws ecs describe-task-definition \
+                      --task-definition ${PROD_TASK_FAMILY} \
+                      --region ${AWS_REGION} \
+                      --query 'taskDefinition' \
+                      --output json > prod-task-definition.json
+
+                    python3 <<'PY'
+import json
+import os
+
+with open("prod-task-definition.json") as f:
+    task = json.load(f)
+
+image = os.environ["IMAGE_NAME"] + ":" + os.environ["IMAGE_TAG"]
+container_name = os.environ["CONTAINER_NAME"]
+
+for container in task["containerDefinitions"]:
+    if container["name"] == container_name:
+        container["image"] = image
+
+for field in [
+    "taskDefinitionArn",
+    "revision",
+    "status",
+    "requiresAttributes",
+    "compatibilities",
+    "registeredAt",
+    "registeredBy"
+]:
+    task.pop(field, None)
+
+with open("prod-task-definition-new.json", "w") as f:
+    json.dump(task, f)
+
+print("PROD image:", image)
+PY
+
+                    PROD_TASK_DEF_ARN=$(aws ecs register-task-definition \
+                      --cli-input-json file://prod-task-definition-new.json \
+                      --region ${AWS_REGION} \
+                      --query 'taskDefinition.taskDefinitionArn' \
+                      --output text)
+
+                    echo "PROD Task Definition:"
+                    echo "${PROD_TASK_DEF_ARN}"
+
+                    aws ecs update-service \
+                      --cluster ${ECS_CLUSTER} \
+                      --service ${PROD_SERVICE} \
+                      --task-definition ${PROD_TASK_DEF_ARN} \
+                      --force-new-deployment \
+                      --region ${AWS_REGION}
+
+                    echo "PROD deployment started."
+                '''
+            }
+        }
+
+        stage('Verify PROD') {
+            steps {
+                sh '''
+                    echo "=== VERIFY PROD ==="
+
+                    aws ecs wait services-stable \
+                      --cluster ${ECS_CLUSTER} \
+                      --services ${PROD_SERVICE} \
+                      --region ${AWS_REGION}
+
+                    echo "=== PROD SERVICE STATUS ==="
+
+                    aws ecs describe-services \
+                      --cluster ${ECS_CLUSTER} \
+                      --services ${PROD_SERVICE} \
+                      --region ${AWS_REGION} \
+                      --query 'services[0].[serviceName,status,desiredCount,runningCount,pendingCount,taskDefinition]' \
+                      --output table
+
+                    echo "=== PROD RUNNING IMAGE ==="
+
+                    TASK_ARN=$(aws ecs list-tasks \
+                      --cluster ${ECS_CLUSTER} \
+                      --service-name ${PROD_SERVICE} \
+                      --desired-status RUNNING \
+                      --region ${AWS_REGION} \
+                      --query 'taskArns[0]' \
+                      --output text)
+
+                    PROD_IMAGE=$(aws ecs describe-tasks \
+                      --cluster ${ECS_CLUSTER} \
+                      --tasks ${TASK_ARN} \
+                      --region ${AWS_REGION} \
+                      --query 'tasks[0].containers[?name==`java-app`].image' \
+                      --output text)
+
+                    echo "PROD Running Image:"
+                    echo "${PROD_IMAGE}"
+
+                    EXPECTED_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+                    if [ "${PROD_IMAGE}" != "${EXPECTED_IMAGE}" ]; then
+                        echo "ERROR: PROD image does not match expected image."
+                        exit 1
+                    fi
+
+                    echo "PROD image verification successful."
                 '''
             }
         }
@@ -210,24 +335,26 @@ PY
     post {
         success {
             echo '========================================'
-            echo 'PROJECT 5 DEPLOYMENT SUCCESSFUL'
+            echo 'PROJECT 7 DEV TO PROD SUCCESSFUL'
             echo '========================================'
             echo "Docker Image: ${IMAGE_NAME}:${IMAGE_TAG}"
-            echo "ECS Service: ${ECS_SERVICE}"
+            echo "DEV Service: ${DEV_SERVICE}"
+            echo "PROD Service: ${PROD_SERVICE}"
         }
 
         failure {
             echo '========================================'
-            echo 'PROJECT 5 PIPELINE FAILED'
+            echo 'PROJECT 7 PIPELINE FAILED'
             echo '========================================'
-            echo 'Deployment stopped because a pipeline stage failed.'
+            echo 'Deployment stopped because a stage failed.'
         }
 
         always {
             sh '''
-                rm -f task-definition.json
-                rm -f new-task-definition.json
-                rm -f new-task-definition-arn.txt
+                rm -f dev-task-definition.json
+                rm -f dev-task-definition-new.json
+                rm -f prod-task-definition.json
+                rm -f prod-task-definition-new.json
             '''
         }
     }
